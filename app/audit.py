@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+from app.config import load_local_env
 from app.schemas import AuditLogEntry
 
 
@@ -18,12 +20,23 @@ def hash_payload(payload: Any) -> str:
 
 
 class AuditLog:
-    """Append records in memory and optionally to a newline-delimited JSON file."""
+    """Append records to JSONL by default and retain detached in-memory snapshots."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
-        self.path = Path(path) if path is not None else None
+    def __init__(
+        self, path: str | Path | None = None, *, in_memory: bool = False,
+    ) -> None:
+        load_local_env()
+        if in_memory:
+            self.path = None
+        else:
+            self.path = Path(path or os.environ.get("AUDIT_LOG_PATH", "audit/audit.jsonl"))
         self._lock = asyncio.Lock()
         self._entries: list[AuditLogEntry] = []
+        if self.path is not None and self.path.is_file():
+            with self.path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        self._entries.append(AuditLogEntry.model_validate_json(line))
 
     async def append(self, entry: AuditLogEntry) -> None:
         """Append one entry; existing entries are never edited or removed."""

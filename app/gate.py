@@ -1,9 +1,12 @@
-"""Deterministic checks for proposed payload and allowlisted-header mappings."""
+"""Named deterministic guardrails for proposed payload and header mappings."""
 
 from collections.abc import Mapping, Set
 from typing import Any
 
-from app.schemas import GateVerdict, MappingOp
+from app.schemas import GateVerdict, GuardrailCheck, MappingOp
+
+
+_SENSITIVE_PARTS = ("auth", "token", "scope", "credential", "secret", "password")
 
 
 def evaluate_mapping(
@@ -13,51 +16,114 @@ def evaluate_mapping(
     implicated_paths: Set[str],
     header_allowlist: Mapping[str, str] | None = None,
 ) -> GateVerdict:
-    """Check provenance, scope, and cast safety before an adapter applies ops.
-
-    ``implicated_paths`` must come from structured error analysis. This check
-    does not replace validation of the transformed request against the target
-    schema, which must happen before replay.
-    """
+    """Evaluate every named safety check and return the complete guardrail matrix."""
     allowed_headers = header_allowlist or {}
-    reasons: list[str] = []
+    failures: list[str] = []
+
+    auth_reason = "No authentication, token, or scope repair is proposed."
+    sensitive = [path for path in implicated_paths if _sensitive(path)]
+    sensitive.extend(
+        path for op in ops for path in (op.source, op.target, op.header)
+        if path and _sensitive(path)
+    )
+    auth_passed = not sensitive
+    if not auth_passed:
+        auth_reason = "Authentication tokens, credentials, and scopes cannot be repaired automatically."
+        failures.append(auth_reason)
+
+    lossy_ops = [
+        op for op in ops
+        if op.op == "cast" and (
+            op.cast_to is None
+            or not (found := _read_pointer(payload, op.source or ""))[0]
+            or not _lossless_cast(found[1], op.cast_to)
+        )
+    ]
+    cast_passed = not lossy_ops
+    cast_reason = (
+        "Every cast is lossless."
+        if cast_passed else "One or more casts are missing a target type or would lose/change data."
+    )
+    if not cast_passed:
+        failures.append(cast_reason)
+
+    provenance_issues: list[str] = []
     for index, op in enumerate(ops):
-        prefix = f"operation {index}"
         if op.op == "add_header":
-            if not op.header:
-                reasons.append(f"{prefix} has no header name")
-            elif op.header not in allowed_headers:
-                reasons.append(f"header {op.header!r} is not allowlisted")
-            elif not any(
+            if not op.header or op.header not in allowed_headers:
+                provenance_issues.append(f"operation {index}: header is not allowlisted")
+            if op.source is not None or op.target is not None or op.cast_to is not None:
+                provenance_issues.append(f"operation {index}: header operation has payload fields")
+            continue
+        found, _ = _read_pointer(payload, op.source or "")
+        if not op.source or not op.target or not found:
+            provenance_issues.append(f"operation {index}: target has no source value in the original payload")
+    provenance_passed = not provenance_issues
+    provenance_reason = "; ".join(provenance_issues) if provenance_issues else (
+        "Every target value comes from the original payload or an allowlisted header."
+    )
+    if not provenance_passed:
+        failures.append(provenance_reason)
+
+    scope_issues: list[str] = []
+    for index, op in enumerate(ops):
+        if op.op == "add_header":
+            if op.header and not any(
                 path.rsplit("/", 1)[-1].lower() == op.header.lower()
                 for path in implicated_paths
             ):
-                reasons.append(f"header {op.header!r} was not implicated by the error")
-            if op.source is not None or op.target is not None or op.cast_to is not None:
-                reasons.append(f"{prefix} has fields unrelated to add_header")
-            continue
+                scope_issues.append(f"operation {index}: header was not implicated")
+        elif op.target and op.target not in implicated_paths:
+            scope_issues.append(f"operation {index}: target {op.target} was not implicated")
+    scope_passed = not scope_issues
+    scope_reason = "; ".join(scope_issues) if scope_issues else (
+        "Every operation is limited to a field implicated by the error."
+    )
+    if not scope_passed:
+        failures.append(scope_reason)
 
-        if not op.source or not op.target:
-            reasons.append(f"{prefix} requires source and target paths")
+    ambiguity_issues: list[str] = []
+    for index, op in enumerate(ops):
+        if op.op not in {"move", "rename"} or not op.target or not op.source:
             continue
-        value_found, source_value = _read_pointer(payload, op.source)
-        if not value_found:
-            reasons.append(f"{op.target} has no source value at {op.source}")
+        target_found, _ = _read_pointer(payload, op.target)
+        if target_found:
             continue
-        if op.target not in implicated_paths:
-            reasons.append(f"{op.target} was not implicated by the error")
-        if op.op == "cast":
-            if op.cast_to is None:
-                reasons.append(f"{prefix} has no cast target")
-            elif not _lossless_cast(source_value, op.cast_to):
-                reasons.append(f"cast from {op.source} to {op.cast_to} is not lossless")
-        elif op.cast_to is not None:
-            reasons.append(f"{prefix} sets cast_to for a non-cast operation")
-    return GateVerdict(allowed=not reasons, reasons=reasons)
+        source_found, source_value = _read_pointer(payload, op.source)
+        if not source_found:
+            continue
+        source_kind = _value_kind(source_value)
+        candidates = [
+            path for path, value in _value_paths(payload)
+            if path not in implicated_paths and _value_kind(value) == source_kind
+        ]
+        if len(candidates) > 1:
+            ambiguity_issues.append(
+                f"operation {index}: {op.target} has {len(candidates)} compatible source candidates"
+            )
+    ambiguity_passed = not ambiguity_issues
+    ambiguity_reason = "; ".join(ambiguity_issues) if ambiguity_issues else (
+        "No target has multiple compatible source candidates."
+    )
+    if not ambiguity_passed:
+        failures.append(ambiguity_reason)
+
+    checks = [
+        GuardrailCheck(name="auth", passed=auth_passed, reason=auth_reason),
+        GuardrailCheck(name="lossy_cast", passed=cast_passed, reason=cast_reason),
+        GuardrailCheck(name="provenance", passed=provenance_passed, reason=provenance_reason),
+        GuardrailCheck(name="scope", passed=scope_passed, reason=scope_reason),
+        GuardrailCheck(name="ambiguity", passed=ambiguity_passed, reason=ambiguity_reason),
+    ]
+    return GateVerdict(allowed=not failures, reasons=failures, checks=checks)
+
+
+def _sensitive(path: str) -> bool:
+    lowered = path.lower()
+    return any(part in lowered for part in _SENSITIVE_PARTS)
 
 
 def _read_pointer(document: Any, pointer: str) -> tuple[bool, Any]:
-    """Read a JSON Pointer and distinguish a missing value from JSON null."""
     if pointer == "":
         return True, document
     if not pointer.startswith("/"):
@@ -75,7 +141,6 @@ def _read_pointer(document: Any, pointer: str) -> tuple[bool, Any]:
 
 
 def _lossless_cast(value: Any, target: str) -> bool:
-    """Allow only round-trippable scalar conversions; reject ambiguous forms."""
     if target == "str":
         return isinstance(value, (str, int, float, bool))
     if target == "int":
@@ -88,9 +153,7 @@ def _lossless_cast(value: Any, target: str) -> bool:
                 return str(int(value)) == value.strip()
             except ValueError:
                 return False
-        if isinstance(value, float):
-            return value.is_integer()
-        return False
+        return isinstance(value, float) and value.is_integer()
     if target == "float":
         if isinstance(value, bool):
             return False
@@ -102,3 +165,31 @@ def _lossless_cast(value: Any, target: str) -> bool:
     if target == "bool":
         return isinstance(value, bool)
     return False
+
+
+def _value_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "other"
+
+
+def _value_paths(payload: Any, pointer: str = "") -> list[tuple[str, Any]]:
+    values: list[tuple[str, Any]] = []
+    if isinstance(payload, Mapping):
+        for key, child in payload.items():
+            token = str(key).replace("~", "~0").replace("/", "~1")
+            values.extend(_value_paths(child, f"{pointer}/{token}"))
+    elif isinstance(payload, list):
+        for index, child in enumerate(payload):
+            values.extend(_value_paths(child, f"{pointer}/{index}"))
+    else:
+        values.append((pointer, payload))
+    return values

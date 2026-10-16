@@ -99,7 +99,7 @@ async def invoke_tool(
         if x_api_version != "2026-01-01":
             errors.append(("X-Api-Version", "required header is missing or invalid"))
         if "account_id" not in payload:
-            errors.append(("account_id", "field required"))
+            errors.append(("account_id", "field required; must be a string"))
         if errors:
             raise _validation_errors(422, errors)
     if mutation in ("required_header", "compound") and x_api_version != "2026-01-01":
@@ -110,7 +110,7 @@ async def invoke_tool(
     value: Any
     if mutation in ("rename", "compound"):
         if "account_id" not in payload:
-            raise _validation_error(422, "account_id", "field required")
+            raise _validation_error(422, "account_id", "field required; must be a string")
         value = payload["account_id"]
     elif mutation == "nesting":
         target = payload.get("target")

@@ -29,12 +29,21 @@ class Diagnosis(BaseModel):
     llm_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class GuardrailCheck(BaseModel):
+    """One named pass/fail result from the deterministic safety matrix."""
+
+    name: str
+    passed: bool
+    reason: str
+
+
 class GateVerdict(BaseModel):
     """Deterministic decision about whether proposed operations are safe."""
 
     allowed: bool
     reasons: list[str] = Field(default_factory=list)
     evaluated: bool = True
+    checks: list[GuardrailCheck] | None = None
 
 
 class Escalation(BaseModel):
@@ -60,7 +69,8 @@ class AuditLogEntry(BaseModel):
     evidence: str
     gate: GateVerdict
     outcome: Literal[
-        "succeeded", "healed", "halted", "replay_failed", "response_contract_mismatch"
+        "succeeded", "healed", "halted", "replay_failed", "failed_rolled_back",
+        "response_contract_mismatch",
     ]
     payload_hash_before: str
     rollback_ref: str | None

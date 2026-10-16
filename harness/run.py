@@ -14,6 +14,7 @@ from app.diff_engine import GeminiMappingDiagnoser
 from app.executor import HealingExecutor
 from app.metrics import summarize_cases
 from app.registry import SchemaRegistry, register_mock_tool
+from app.proxy import app as proxy_app, configure_executor
 from baseline.langchain_agent import LangChainBaseline
 from mock_service.server import app as mock_app
 
@@ -30,7 +31,7 @@ async def run_evaluation(
     audit_log = AuditLog()
     cases: list[dict[str, Any]] = []
     baseline_cases: list[dict[str, Any]] = []
-    scenarios = [
+    base_scenarios = [
         (
             "type_change", "healable", {"user_id": "123"},
             {"user_id": 123}, {},
@@ -60,23 +61,28 @@ async def run_evaluation(
         ),
     ]
     if llm_diagnoser is not None or baseline_agent is not None:
-        scenarios.append((
+        base_scenarios.append((
             "profile_nesting", "healable", {"user_id": "123"},
             {"profile": {"id": "123"}}, {},
         ))
-    scenarios = [
-        (*scenario, run_number)
-        for scenario in scenarios
-        for run_number in range(1, repeats + 1)
-    ]
+    error_formats = ("fastapi", "problem", "joi", "plain")
+    scenarios: list[tuple[Any, ...]] = []
+    for mutation, expected, payload, expected_payload, headers in base_scenarios:
+        formats = error_formats if expected == "healable" else ("fastapi",)
+        for error_format in formats:
+            for run_number in range(1, repeats + 1):
+                scenarios.append((
+                    mutation, expected, payload, expected_payload, headers,
+                    error_format, run_number,
+                ))
 
     async with httpx.AsyncClient(
         transport=transport, base_url="http://mock-service", timeout=httpx.Timeout(10.0)
     ) as admin:
-        for mutation, expected, payload, expected_payload, headers, run_number in scenarios:
+        for mutation, expected, payload, expected_payload, headers, error_format, run_number in scenarios:
             configured = await admin.put(
                 "/admin/mutation",
-                json={"mutation": mutation, "error_format": "fastapi"},
+                json={"mutation": mutation, "error_format": error_format},
             )
             configured.raise_for_status()
             await admin.delete("/admin/records")
@@ -84,30 +90,50 @@ async def run_evaluation(
             if mutation == "profile_nesting" and llm_diagnoser is None:
                 cases.append({
                     "mutation": mutation, "run": run_number, "expected": expected,
+                    "error_format": error_format,
                     "classification": "skipped", "reason": "requires --gemini",
                 })
             else:
                 registry = SchemaRegistry()
                 await register_mock_tool(registry, "http://mock-service")
                 before_audit = len(await audit_log.entries())
-                result = await HealingExecutor(
+                executor = HealingExecutor(
                     registry,
                     transport=transport,
                     header_allowlist=headers if "X-Api-Version" in headers else {},
                     audit_log=audit_log,
                     llm_diagnoser=llm_diagnoser if mutation in ("profile_nesting", "required_tenant") else None,
-                ).execute("lookup_user", payload)
+                )
+                configure_executor(executor)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=proxy_app),
+                    base_url="http://healgate-proxy", timeout=httpx.Timeout(10.0),
+                ) as proxy_client:
+                    proxy_result = await proxy_client.post(
+                        "/tools/lookup_user/call",
+                        # The new header is a repair value in the allowlist, not
+                        # something the original agent request already supplied.
+                        json={"payload": payload, "headers": {}},
+                    )
                 state = (await admin.get("/admin/state")).json()
                 records = state["records"]
                 audit_entries = await audit_log.entries()
                 new_entries = audit_entries[before_audit:]
                 audit = new_entries[-1] if new_entries else None
+                proxy_outcome = proxy_result.headers.get("x-healgate-outcome")
+                attempts = 2 if audit and audit.outcome in {
+                    "healed", "failed_rolled_back", "replay_failed"
+                } else 1
                 cases.append(_score_case(
-                    mutation=mutation, run_number=run_number, expected=expected,
+                    mutation=mutation, error_format=error_format,
+                    run_number=run_number, expected=expected,
                     expected_payload=expected_payload, headers=headers, records=records,
-                    status_code=result.status_code, attempts=result.attempts,
-                    healed=result.healed, outcome=audit.outcome if audit else None,
-                    response_contract_ok=result.response_contract_ok,
+                    status_code=proxy_result.status_code, attempts=attempts,
+                    healed=proxy_outcome == "healed", outcome=audit.outcome if audit else None,
+                    response_contract_ok=(
+                        False if audit and audit.outcome == "response_contract_mismatch"
+                        else True if proxy_result.is_success else None
+                    ),
                     diagnosis_source=audit.diagnosis_source if audit else None,
                     gate_allowed=audit.gate.allowed if audit else None,
                     tokens_used=audit.tokens_used if audit else 0,
@@ -117,7 +143,7 @@ async def run_evaluation(
             if baseline_agent is not None:
                 reset = await admin.put(
                     "/admin/mutation",
-                    json={"mutation": mutation, "error_format": "fastapi"},
+                    json={"mutation": mutation, "error_format": error_format},
                 )
                 reset.raise_for_status()
                 await admin.delete("/admin/records")
@@ -140,7 +166,8 @@ async def run_evaluation(
                     and any(call["status_code"] >= 400 for call in baseline_calls[:-1])
                 )
                 baseline_cases.append(_score_case(
-                    mutation=mutation, run_number=run_number, expected=expected,
+                    mutation=mutation, error_format=error_format,
+                    run_number=run_number, expected=expected,
                     expected_payload=expected_payload, headers=headers,
                     records=baseline_records, status_code=baseline_status,
                     attempts=len(baseline_calls), healed=baseline_healed,
@@ -157,14 +184,23 @@ async def run_evaluation(
 
     if baseline_agent is None and llm_diagnoser is None:
         for run_number in range(1, repeats + 1):
-            cases.append({
-                "mutation": "profile_nesting", "run": run_number,
-                "expected": "healable", "classification": "skipped",
-                "reason": "requires --gemini",
-            })
+            for error_format in error_formats:
+                cases.append({
+                    "mutation": "profile_nesting", "run": run_number,
+                    "expected": "healable", "error_format": error_format,
+                    "classification": "skipped", "reason": "requires --gemini",
+                })
+    tier1_coverage_by_format = {
+        error_format: summarize_cases([
+            case for case in cases
+            if case.get("error_format") == error_format and case["expected"] == "healable"
+        ])["tier1_coverage"]
+        for error_format in error_formats
+    }
     return {
         "runs_per_mutation": repeats,
         "metrics": summarize_cases(cases),
+        "tier1_coverage_by_error_format": tier1_coverage_by_format,
         "cases": cases,
         "baseline": (
             {"metrics": summarize_cases(baseline_cases), "cases": baseline_cases}
@@ -174,7 +210,7 @@ async def run_evaluation(
 
 
 def _score_case(
-    *, mutation: str, run_number: int, expected: str,
+    *, mutation: str, error_format: str, run_number: int, expected: str,
     expected_payload: dict[str, Any] | None, headers: dict[str, str],
     records: list[dict[str, Any]], status_code: int | None, attempts: int,
     healed: bool, outcome: str | None, response_contract_ok: bool | None,
@@ -221,6 +257,7 @@ def _score_case(
 
     return {
         "mutation": mutation,
+        "error_format": error_format,
         "run": run_number,
         "expected": expected,
         "classification": classification,
