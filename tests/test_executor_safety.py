@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from app.audit import AuditLog
 from app.executor import HealingExecutor
 from app.registry import SchemaRegistry, register_mock_tool
 from mock_service.server import app as mock_app
@@ -132,5 +133,79 @@ def test_required_header_without_allowlist_is_refused() -> None:
         assert "not allowlisted" in result.escalation.reason
         assert current.version == 1
         assert state["records"] == []
+
+    _run(scenario())
+
+
+def test_response_shape_drift_is_reported_without_replay() -> None:
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=mock_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as admin:
+            response = await admin.put(
+                "/admin/mutation",
+                json={"mutation": "response_nested", "error_format": "fastapi"},
+            )
+            response.raise_for_status()
+            await admin.delete("/admin/records")
+
+            registry = SchemaRegistry()
+            await register_mock_tool(registry, "http://mock")
+            audit_log = AuditLog()
+            result = await HealingExecutor(
+                registry, transport=transport, audit_log=audit_log
+            ).execute(
+                "lookup_user", {"user_id": "123"}
+            )
+            state = (await admin.get("/admin/state")).json()
+            current = await registry.get("lookup_user")
+            audit_entries = await audit_log.entries()
+
+        assert result.status_code == 200
+        assert result.attempts == 1
+        assert not result.healed
+        assert result.response_contract_ok is False
+        assert any("/user_id is required" in issue for issue in result.response_contract_issues or [])
+        assert any("/data is unexpected" in issue for issue in result.response_contract_issues or [])
+        assert current.version == 1
+        assert len(state["records"]) == 1
+        assert len(audit_entries) == 1
+        entry = audit_entries[0]
+        assert entry.outcome == "response_contract_mismatch"
+        assert entry.diagnosis_source is None
+        assert not entry.gate.evaluated
+        assert len(entry.payload_hash_before) == 64
+        assert "payload" not in entry.model_dump()
+
+    _run(scenario())
+
+
+def test_compound_rule_handles_supported_error_formats() -> None:
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=mock_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as admin:
+            for error_format in ("fastapi", "problem", "joi", "plain"):
+                response = await admin.put(
+                    "/admin/mutation",
+                    json={"mutation": "compound", "error_format": error_format},
+                )
+                response.raise_for_status()
+                await admin.delete("/admin/records")
+
+                registry = SchemaRegistry()
+                await register_mock_tool(registry, "http://mock")
+                result = await HealingExecutor(
+                    registry,
+                    transport=transport,
+                    header_allowlist={"X-Api-Version": "2026-01-01"},
+                ).execute("lookup_user", {"user_id": "123"})
+                state = (await admin.get("/admin/state")).json()
+
+                assert result.status_code == 200, error_format
+                assert result.healed and result.attempts == 2, error_format
+                assert len(state["records"]) == 1, error_format
+                assert state["records"][0]["received"] == {"account_id": "123"}, error_format
+                assert state["records"][0]["received_headers"] == {
+                    "X-Api-Version": "2026-01-01"
+                }, error_format
 
     _run(scenario())

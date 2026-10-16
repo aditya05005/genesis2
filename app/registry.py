@@ -17,6 +17,7 @@ class ToolSchema:
     schema: dict[str, Any]
     version: int
     idempotent: bool = False
+    response_schema: dict[str, Any] | None = None
 
 
 class SchemaRegistry:
@@ -28,13 +29,22 @@ class SchemaRegistry:
         self._history: dict[str, dict[str, ToolSchema]] = {}
 
     async def register(
-        self, name: str, url: str, schema: dict[str, Any], *, idempotent: bool = False
+        self,
+        name: str,
+        url: str,
+        schema: dict[str, Any],
+        *,
+        idempotent: bool = False,
+        response_schema: dict[str, Any] | None = None,
     ) -> ToolSchema:
         """Register an initial schema, or return the existing tool unchanged."""
         async with self._lock:
             if name in self._tools:
                 return self._copy(self._tools[name])
-            tool = ToolSchema(name, url, deepcopy(schema), 1, idempotent)
+            tool = ToolSchema(
+                name, url, deepcopy(schema), 1, idempotent,
+                deepcopy(response_schema) if response_schema is not None else None,
+            )
             self._tools[name] = tool
             self._history[name] = {}
             return self._copy(tool)
@@ -59,7 +69,7 @@ class SchemaRegistry:
             self._history[name][rollback_ref] = self._copy(current)
             updated = ToolSchema(
                 current.name, current.url, deepcopy(schema), current.version + 1,
-                current.idempotent,
+                current.idempotent, deepcopy(current.response_schema),
             )
             self._tools[name] = updated
             return self._copy(updated), rollback_ref
@@ -73,14 +83,17 @@ class SchemaRegistry:
             current = self._tools[name]
             restored = ToolSchema(
                 current.name, current.url, deepcopy(snapshot.schema), current.version + 1,
-                current.idempotent,
+                current.idempotent, deepcopy(snapshot.response_schema),
             )
             self._tools[name] = restored
             return self._copy(restored)
 
     @staticmethod
     def _copy(tool: ToolSchema) -> ToolSchema:
-        return ToolSchema(tool.name, tool.url, deepcopy(tool.schema), tool.version, tool.idempotent)
+        return ToolSchema(
+            tool.name, tool.url, deepcopy(tool.schema), tool.version, tool.idempotent,
+            deepcopy(tool.response_schema) if tool.response_schema is not None else None,
+        )
 
 
 async def register_mock_tool(registry: SchemaRegistry, base_url: str) -> ToolSchema:
@@ -92,5 +105,15 @@ async def register_mock_tool(registry: SchemaRegistry, base_url: str) -> ToolSch
             "type": "object",
             "required": ["user_id"],
             "properties": {"user_id": {"type": "string"}},
+        },
+        response_schema={
+            "type": "object",
+            "required": ["ok", "record_id", "user_id"],
+            "additionalProperties": False,
+            "properties": {
+                "ok": {"type": "boolean"},
+                "record_id": {"type": "integer"},
+                "user_id": {"type": "string"},
+            },
         },
     )
