@@ -3,26 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
 from typing import Any
 
 import httpx
 
 from app.audit import AuditLog
+from app.diff_engine import GeminiMappingDiagnoser
 from app.executor import HealingExecutor
 from app.registry import SchemaRegistry, register_mock_tool
 from mock_service.server import app as mock_app
 
 
-async def run_demo() -> dict[str, Any]:
-    """Exercise each supported repair, including a combined header and rename."""
+async def run_demo(
+    *, llm_diagnoser: GeminiMappingDiagnoser | None = None,
+) -> dict[str, Any]:
+    """Exercise deterministic repairs and, when supplied, one LLM-only repair."""
     transport = httpx.ASGITransport(app=mock_app)
     cases = []
     audit_log = AuditLog()
     async with httpx.AsyncClient(
         transport=transport, base_url="http://mock-service", timeout=httpx.Timeout(5.0)
     ) as admin:
-        for mutation, payload, expected_received, header_allowlist in (
+        scenarios = [
             ("type_change", {"user_id": "123"}, {"user_id": 123}, {}),
             ("rename", {"user_id": "123"}, {"account_id": "123"}, {}),
             ("nesting", {"user_id": "123"}, {"target": {"id": 123}}, {}),
@@ -39,7 +43,13 @@ async def run_demo() -> dict[str, Any]:
                 {"X-Api-Version": "2026-01-01"},
             ),
             ("response_nested", {"user_id": "123"}, {"user_id": "123"}, {}),
-        ):
+        ]
+        if llm_diagnoser is not None:
+            scenarios.append((
+                "profile_nesting", {"user_id": "123"}, {"profile": {"id": "123"}}, {}
+            ))
+
+        for mutation, payload, expected_received, header_allowlist in scenarios:
             configured = await admin.put(
                 "/admin/mutation",
                 json={"mutation": mutation, "error_format": "fastapi"},
@@ -52,6 +62,7 @@ async def run_demo() -> dict[str, Any]:
             result = await HealingExecutor(
                 registry, transport=transport, header_allowlist=header_allowlist,
                 audit_log=audit_log,
+                llm_diagnoser=llm_diagnoser if mutation == "profile_nesting" else None,
             ).execute("lookup_user", payload
             )
             state_response = await admin.get("/admin/state")
@@ -88,6 +99,8 @@ async def run_demo() -> dict[str, Any]:
                 raise RuntimeError(f"{mutation} replay sent unexpected headers: {record['received_headers']!r}")
 
             current_schema = await registry.get("lookup_user")
+            if mutation == "nesting" and current_schema.schema.get("required") != ["target"]:
+                raise RuntimeError("nested schema did not mark target as required")
             cases.append({
                 "mutation": mutation,
                 "status_code": result.status_code,
@@ -110,8 +123,15 @@ async def run_demo() -> dict[str, Any]:
 
 
 def main() -> None:
-    """Print a compact result; raise a nonzero exit on a failed demo assertion."""
-    print(json.dumps(asyncio.run(run_demo()), indent=2))
+    """Print demo results; --gemini adds a real, opt-in model call."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--gemini", action="store_true",
+        help="run the profile-nesting case with the configured Gemini model",
+    )
+    args = parser.parse_args()
+    diagnoser = GeminiMappingDiagnoser.from_env() if args.gemini else None
+    print(json.dumps(asyncio.run(run_demo(llm_diagnoser=diagnoser)), indent=2))
 
 
 if __name__ == "__main__":

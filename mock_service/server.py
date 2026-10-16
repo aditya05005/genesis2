@@ -15,6 +15,7 @@ Mutation = Literal[
     "rename",
     "type_change",
     "nesting",
+    "profile_nesting",
     "required_header",
     "compound",
     "required_tenant",
@@ -116,6 +117,11 @@ async def invoke_tool(
         if not isinstance(target, dict) or "id" not in target:
             raise _validation_error(422, "target.id", "field required; must be an integer")
         value = target["id"]
+    elif mutation == "profile_nesting":
+        profile = payload.get("profile")
+        if not isinstance(profile, dict) or "id" not in profile:
+            raise _validation_error(422, "profile.id", "field required")
+        value = profile["id"]
     else:
         if "user_id" not in payload:
             raise _validation_error(422, "user_id", "field required")
@@ -127,7 +133,7 @@ async def invoke_tool(
             raise _validation_error(422, field, "must be an integer")
     elif mutation in (
         "legacy", "rename", "required_header", "compound", "required_tenant",
-        "auth_scope", "response_nested",
+        "auth_scope", "response_nested", "profile_nesting",
     ):
         if not isinstance(value, str):
             raise _validation_error(422, "user_id", "must be a string")
