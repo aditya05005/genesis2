@@ -91,6 +91,21 @@ def _write_pointer(document: Any, pointer: str, value: Any) -> None:
         raise MappingError(f"target {pointer!r} does not have a writable parent")
 
 
+def _parent(document: Any, pointer: str) -> tuple[Any, str]:
+    parts = _parts(pointer)
+    if not parts:
+        raise MappingError("removing the whole request is not supported")
+    parent = document
+    for part in parts[:-1]:
+        if isinstance(parent, Mapping) and part in parent:
+            parent = parent[part]
+        elif isinstance(parent, list) and part.isdigit() and int(part) < len(parent):
+            parent = parent[int(part)]
+        else:
+            raise MappingError(f"parent for {pointer!r} does not exist")
+    return parent, parts[-1]
+
+
 def _remove_pointer(document: Any, pointer: str) -> None:
     parent, key = _parent(document, pointer)
     if isinstance(parent, dict) and key in parent:

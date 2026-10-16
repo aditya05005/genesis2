@@ -112,6 +112,7 @@ async def invoke_tool(
     record = {
         "mutation": mutation,
         "received": payload.copy(),
+        "received_headers": {"X-Api-Version": x_api_version} if x_api_version is not None else {},
         "ground_truth": {"user_id": str(value)},
     }
     async with _lock:

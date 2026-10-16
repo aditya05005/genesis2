@@ -1,0 +1,136 @@
+"""Failure-path checks for the minimal healing executor."""
+
+import asyncio
+import json
+from typing import Any
+
+import httpx
+
+from app.executor import HealingExecutor
+from app.registry import SchemaRegistry, register_mock_tool
+from mock_service.server import app as mock_app
+
+
+def _run(coro: Any) -> Any:
+    """Run an async scenario without requiring pytest-asyncio."""
+    return asyncio.run(coro)
+
+
+def test_lossy_cast_halts_without_replay_or_registry_update() -> None:
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=mock_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as admin:
+            response = await admin.put(
+                "/admin/mutation",
+                json={"mutation": "lossy_integer", "error_format": "fastapi"},
+            )
+            response.raise_for_status()
+            await admin.delete("/admin/records")
+
+            registry = SchemaRegistry()
+            await register_mock_tool(registry, "http://mock")
+            result = await HealingExecutor(registry, transport=transport).execute(
+                "lookup_user", {"user_id": "1.7"}
+            )
+            state = (await admin.get("/admin/state")).json()
+            current = await registry.get("lookup_user")
+
+        assert result.status_code == 422
+        assert result.attempts == 1
+        assert not result.healed
+        assert result.escalation is not None
+        assert current.version == 1
+        assert current.schema["properties"]["user_id"]["type"] == "string"
+        assert state["records"] == []
+
+    _run(scenario())
+
+
+def test_failed_replay_does_not_publish_schema() -> None:
+    async def scenario() -> None:
+        seen_payloads: list[dict[str, Any]] = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            seen_payloads.append(json.loads(request.content))
+            if len(seen_payloads) == 1:
+                return httpx.Response(
+                    422,
+                    json={"detail": [{"loc": ["body", "user_id"], "msg": "must be an integer"}]},
+                )
+            return httpx.Response(500, json={"detail": "upstream failed"})
+
+        registry = SchemaRegistry()
+        await register_mock_tool(registry, "http://mock")
+        result = await HealingExecutor(
+            registry, transport=httpx.MockTransport(respond)
+        ).execute("lookup_user", {"user_id": "123"})
+        current = await registry.get("lookup_user")
+
+        assert result.status_code == 500
+        assert result.attempts == 2
+        assert not result.healed
+        assert result.escalation is not None
+        assert seen_payloads == [{"user_id": "123"}, {"user_id": 123}]
+        assert current.version == 1
+        assert current.schema["properties"]["user_id"]["type"] == "string"
+
+    _run(scenario())
+
+
+def test_forbidden_response_is_not_healed() -> None:
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=mock_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as admin:
+            response = await admin.put(
+                "/admin/mutation",
+                json={"mutation": "auth_scope", "error_format": "fastapi"},
+            )
+            response.raise_for_status()
+            await admin.delete("/admin/records")
+
+            registry = SchemaRegistry()
+            await register_mock_tool(registry, "http://mock")
+            result = await HealingExecutor(registry, transport=transport).execute(
+                "lookup_user", {"user_id": "123"}
+            )
+            state = (await admin.get("/admin/state")).json()
+            current = await registry.get("lookup_user")
+
+        assert result.status_code == 403
+        assert result.attempts == 1
+        assert not result.healed
+        assert result.escalation is not None
+        assert current.version == 1
+        assert state["records"] == []
+
+    _run(scenario())
+
+
+def test_required_header_without_allowlist_is_refused() -> None:
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=mock_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as admin:
+            response = await admin.put(
+                "/admin/mutation",
+                json={"mutation": "required_header", "error_format": "fastapi"},
+            )
+            response.raise_for_status()
+            await admin.delete("/admin/records")
+
+            registry = SchemaRegistry()
+            await register_mock_tool(registry, "http://mock")
+            result = await HealingExecutor(registry, transport=transport).execute(
+                "lookup_user", {"user_id": "123"}
+            )
+            state = (await admin.get("/admin/state")).json()
+            current = await registry.get("lookup_user")
+
+        assert result.status_code == 422
+        assert result.attempts == 1
+        assert not result.healed
+        assert result.escalation is not None
+        assert "not allowlisted" in result.escalation.reason
+        assert current.version == 1
+        assert state["records"] == []
+
+    _run(scenario())
