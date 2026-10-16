@@ -28,6 +28,11 @@ def evaluate_mapping(
                 reasons.append(f"{prefix} has no header name")
             elif op.header not in allowed_headers:
                 reasons.append(f"header {op.header!r} is not allowlisted")
+            elif not any(
+                path.rsplit("/", 1)[-1].lower() == op.header.lower()
+                for path in implicated_paths
+            ):
+                reasons.append(f"header {op.header!r} was not implicated by the error")
             if op.source is not None or op.target is not None or op.cast_to is not None:
                 reasons.append(f"{prefix} has fields unrelated to add_header")
             continue

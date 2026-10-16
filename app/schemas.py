@@ -34,6 +34,7 @@ class GateVerdict(BaseModel):
 
     allowed: bool
     reasons: list[str] = Field(default_factory=list)
+    evaluated: bool = True
 
 
 class Escalation(BaseModel):
@@ -54,11 +55,13 @@ class AuditLogEntry(BaseModel):
     schema_version_before: int
     schema_version_after: int | None
     status_code: int
-    diagnosis_source: Literal["rule", "llm"]
+    diagnosis_source: Literal["rule", "llm"] | None
     ops: list[MappingOp]
     evidence: str
     gate: GateVerdict
-    outcome: Literal["healed", "halted", "failed_rolled_back"]
+    outcome: Literal[
+        "succeeded", "healed", "halted", "replay_failed", "response_contract_mismatch"
+    ]
     payload_hash_before: str
     rollback_ref: str | None
     latency_ms: float

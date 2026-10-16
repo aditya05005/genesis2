@@ -6,7 +6,9 @@ from typing import Any
 
 
 DEFAULT_MAX_CHARS = 2_000
-_DETAIL_KEYS = ("detail", "errors", "message", "title", "type", "path", "loc", "msg", "field")
+_DETAIL_KEYS = (
+    "detail", "errors", "message", "title", "type", "path", "loc", "msg", "field",
+)
 
 
 def sanitize_error(body: Any, *, max_chars: int = DEFAULT_MAX_CHARS) -> str:
