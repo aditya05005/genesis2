@@ -68,6 +68,8 @@ class HealingExecutor:
         self.transport = transport
         self.audit_log = audit_log or AuditLog()
         self.llm_diagnoser = llm_diagnoser
+        if self.llm_diagnoser is None and os.environ.get("GEMINI_API_KEY"):
+            self.llm_diagnoser = GeminiMappingDiagnoser.from_env()
 
     async def execute(
         self,
@@ -81,7 +83,7 @@ class HealingExecutor:
         request_headers = dict(headers or {})
         started = time.perf_counter()
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-            first = await client.post(tool.url, json=payload, headers=request_headers)
+            first = await _send_upstream(client, tool, payload, request_headers)
             if first.is_success:
                 body = _body(first)
                 result, diagnosis, gate, tokens_used = await self._heal_response(
@@ -136,19 +138,32 @@ class HealingExecutor:
                     evidence=sanitized_error.text,
                 )
             signature = hashlib.sha256(
-                f"{first.status_code}:{sanitized_error.text}".encode("utf-8")
+                (
+                    f"{first.status_code}:{sanitized_error.text}:"
+                    f"{hash_payload({'payload': payload, 'headers': request_headers, 'schema': tool.schema})}"
+                ).encode("utf-8")
             ).hexdigest()
-            diagnosis, tokens_used, llm_failure = await self.registry.singleflight(
-                tool_name, signature,
-                lambda: self._diagnose_request(error_body, payload),
-            )
+            diagnosis = await self.registry.get_cached_diagnosis(tool_name, signature)
+            if diagnosis is not None:
+                tokens_used, llm_failure = 0, False
+            else:
+                diagnosis, tokens_used, llm_failure = await self.registry.singleflight(
+                    tool_name, signature,
+                    lambda: self._diagnose_request(error_body, payload, tool.schema),
+                )
+                if diagnosis is not None:
+                    await self.registry.cache_diagnosis(tool_name, signature, diagnosis)
             if diagnosis is None or not diagnosis.ops:
                 result = ExecutionResult(
                     first.status_code, sanitize_error(_body(first)), 1,
                     escalation=_escalation(
                         first.status_code,
                         "Gemini diagnosis failed; call halted" if llm_failure
-                        else "no supported safe repair was found",
+                        else (
+                            "no supported safe repair was found"
+                            if self.llm_diagnoser is not None
+                            else "no Tier 1 repair was safe and Gemini Tier 2 is not configured; set GEMINI_API_KEY"
+                        ),
                         missing_fields=_missing_fields(error_body, payload),
                     ),
                     schema_version=tool.version,
@@ -162,6 +177,7 @@ class HealingExecutor:
                 diagnosis.ops, payload,
                 implicated_paths=extract_implicated_paths(error_body),
                 header_allowlist=self.header_allowlist,
+                schema=tool.schema,
             )
             if not verdict.allowed:
                 result = ExecutionResult(
@@ -205,7 +221,7 @@ class HealingExecutor:
             staged, rollback_ref = await self.registry.publish_patch(
                 tool_name, schema_patch, expected_version=tool.version
             )
-            replay = await client.post(tool.url, json=changed_payload, headers=changed_headers)
+            replay = await _send_upstream(client, tool, changed_payload, changed_headers)
             if replay.is_success:
                 result, response_diagnosis, response_gate, response_tokens = await self._heal_response(
                     _body(replay), tool, payload
@@ -287,9 +303,11 @@ class HealingExecutor:
         return result
 
     async def _diagnose_request(
-        self, error_body: Any, payload: dict[str, Any]
+        self, error_body: Any, payload: dict[str, Any], schema: dict[str, Any]
     ) -> tuple[Any, int, bool]:
-        diagnosis = diagnose_error(error_body, payload, header_allowlist=self.header_allowlist)
+        diagnosis = diagnose_error(
+            error_body, payload, header_allowlist=self.header_allowlist, schema=schema,
+        )
         tokens_used = 0
         llm_failure = False
         if diagnosis is None and self.llm_diagnoser is not None:
@@ -340,7 +358,9 @@ class HealingExecutor:
                 response_contract_ok=False, response_contract_issues=issues,
             ), diagnosis, None, tokens_used
 
-        verdict = evaluate_mapping(diagnosis.ops, body, implicated_paths=implicated)
+        verdict = evaluate_mapping(
+            diagnosis.ops, body, implicated_paths=implicated, schema=tool.response_schema,
+        )
         if not verdict.allowed:
             return ExecutionResult(
                 200, body, 1, schema_version=tool.version,
@@ -444,6 +464,16 @@ def _body(response: httpx.Response) -> Any:
         return response.json()
     except ValueError:
         return response.text
+
+
+async def _send_upstream(
+    client: httpx.AsyncClient, tool: ToolSchema, payload: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    """Use query parameters for GET tools and JSON bodies for other methods."""
+    if tool.method.upper() == "GET":
+        return await client.request(tool.method, tool.url, params=payload, headers=headers)
+    return await client.request(tool.method, tool.url, json=payload, headers=headers)
 
 
 def _success_result(

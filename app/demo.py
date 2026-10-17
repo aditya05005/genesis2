@@ -202,14 +202,10 @@ async def run_demo(
 
 
 def main() -> None:
-    """Print demo results; --gemini adds a real, opt-in model call."""
+    """Print demo results, using Gemini automatically for Tier 2 diagnosis."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--gemini", action="store_true",
-        help="run the profile-nesting case with the configured Gemini model",
-    )
-    args = parser.parse_args()
-    diagnoser = GeminiMappingDiagnoser.from_env() if args.gemini else None
+    parser.parse_args()
+    diagnoser = GeminiMappingDiagnoser.from_env()
     print(json.dumps(asyncio.run(run_demo(llm_diagnoser=diagnoser)), indent=2))
 
 

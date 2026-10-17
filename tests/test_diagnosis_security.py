@@ -62,6 +62,25 @@ def test_tier_one_refuses_multiple_compatible_missing_field_sources() -> None:
     assert diagnose_error(error, {"old_label": "a", "other_label": "b"}) is None
 
 
+def test_tier_one_heals_unique_single_character_field_typo_and_gate_agrees() -> None:
+    error = {"detail": [{"loc": ["body", "email"], "msg": "Field required"}]}
+    payload = {"name": "TestingManager", "emaill": "testingmanager@test.com",
+               "password": "Password123"}
+    schema = {"type": "object", "properties": {
+        "email": {"type": "string"}, "name": {"type": "string"},
+        "password": {"type": "string"},
+    }}
+    diagnosis = diagnose_error(error, payload, schema=schema)
+    assert diagnosis is not None
+    assert [(op.op, op.source, op.target) for op in diagnosis.ops] == [
+        ("rename", "/emaill", "/email")
+    ]
+    verdict = evaluate_mapping(
+        diagnosis.ops, payload, implicated_paths={"/email"}, schema=schema,
+    )
+    assert verdict.allowed
+
+
 def test_gate_returns_named_checks_and_rejects_auth_and_ambiguous_candidates() -> None:
     auth = evaluate_mapping(
         [MappingOp(op="add_header", header="X-Scope")],

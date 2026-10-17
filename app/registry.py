@@ -14,7 +14,7 @@ from typing import Any, Protocol
 import jsonpatch
 
 from app.config import load_local_env
-from app.schemas import MappingOp
+from app.schemas import Diagnosis, MappingOp
 
 
 @dataclass(frozen=True)
@@ -27,11 +27,14 @@ class ToolSchema:
     version: int
     idempotent: bool = False
     response_schema: dict[str, Any] | None = None
+    method: str = "POST"
 
 
 class SchemaStore(Protocol):
     async def get(self, name: str) -> dict[str, Any] | None: ...
     async def set(self, name: str, value: dict[str, Any], ttl: int) -> None: ...
+    async def get_diagnosis(self, name: str) -> dict[str, Any] | None: ...
+    async def set_diagnosis(self, name: str, value: dict[str, Any], ttl: int) -> None: ...
 
 
 class MemorySchemaStore:
@@ -40,6 +43,7 @@ class MemorySchemaStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._items: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._diagnoses: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def get(self, name: str) -> dict[str, Any] | None:
         with self._lock:
@@ -56,6 +60,21 @@ class MemorySchemaStore:
         with self._lock:
             self._items[name] = (time.monotonic() + ttl, deepcopy(value))
 
+    async def get_diagnosis(self, name: str) -> dict[str, Any] | None:
+        with self._lock:
+            cached = self._diagnoses.get(name)
+            if cached is None:
+                return None
+            expires, value = cached
+            if expires <= time.monotonic():
+                self._diagnoses.pop(name, None)
+                return None
+            return deepcopy(value)
+
+    async def set_diagnosis(self, name: str, value: dict[str, Any], ttl: int) -> None:
+        with self._lock:
+            self._diagnoses[name] = (time.monotonic() + ttl, deepcopy(value))
+
 
 class RedisSchemaStore:
     """Redis JSON storage; import is deferred unless REDIS_URL is configured."""
@@ -71,6 +90,13 @@ class RedisSchemaStore:
 
     async def set(self, name: str, value: dict[str, Any], ttl: int) -> None:
         await self._client.set(f"healgate:schema:{name}", json.dumps(value), ex=ttl)
+
+    async def get_diagnosis(self, name: str) -> dict[str, Any] | None:
+        value = await self._client.get(f"healgate:diagnosis:{name}")
+        return json.loads(value) if value is not None else None
+
+    async def set_diagnosis(self, name: str, value: dict[str, Any], ttl: int) -> None:
+        await self._client.set(f"healgate:diagnosis:{name}", json.dumps(value), ex=ttl)
 
 
 class SchemaRegistry:
@@ -110,13 +136,16 @@ class SchemaRegistry:
     async def register(
         self, name: str, url: str, schema: dict[str, Any], *,
         idempotent: bool = False, response_schema: dict[str, Any] | None = None,
+        method: str = "POST",
     ) -> ToolSchema:
         async with self._lock:
             current = await self._read(name)
             if current is None:
                 current = {
-                    "tool": asdict(ToolSchema(name, url, deepcopy(schema), 1, idempotent,
-                                               deepcopy(response_schema))),
+                    "tool": asdict(ToolSchema(
+                        name, url, deepcopy(schema), 1, idempotent,
+                        deepcopy(response_schema), method.upper(),
+                    )),
                     "history": {},
                 }
                 await self._write(name, current)
@@ -147,7 +176,7 @@ class SchemaRegistry:
             }
             updated = ToolSchema(
                 current.name, current.url, updated_schema, current.version + 1,
-                current.idempotent, deepcopy(current.response_schema),
+                current.idempotent, deepcopy(current.response_schema), current.method,
             )
             record["tool"] = asdict(updated)
             await self._write(name, record)
@@ -173,6 +202,7 @@ class SchemaRegistry:
             restored = ToolSchema(
                 current.name, current.url, deepcopy(snapshot["schema"]), current.version + 1,
                 current.idempotent, deepcopy(snapshot.get("response_schema")),
+                snapshot.get("method", "POST"),
             )
             record["tool"] = asdict(restored)
             await self._write(name, record)
@@ -182,6 +212,34 @@ class SchemaRegistry:
         async with self._lock:
             record = await self._read(name)
             return deepcopy(record["history"]) if record else {}
+
+    async def get_cached_diagnosis(self, tool: str, signature: str) -> Diagnosis | None:
+        """Return a TTL-bound diagnosis for a matching sanitized failure and payload."""
+        cache_key = f"{tool}:{signature}"
+        cache_store = self._store if hasattr(self._store, "get_diagnosis") else self._memory
+        try:
+            value = await cache_store.get_diagnosis(cache_key)
+        except Exception:
+            if cache_store is self._memory:
+                raise
+            self._store = self._memory
+            value = await self._memory.get_diagnosis(cache_key)
+        return Diagnosis.model_validate(value) if value is not None else None
+
+    async def cache_diagnosis(
+        self, tool: str, signature: str, diagnosis: Diagnosis,
+    ) -> None:
+        """Store only the operation proposal; callers must rerun the safety gate."""
+        cache_key = f"{tool}:{signature}"
+        value = diagnosis.model_dump(mode="json")
+        cache_store = self._store if hasattr(self._store, "set_diagnosis") else self._memory
+        try:
+            await cache_store.set_diagnosis(cache_key, value, self.ttl_seconds)
+        except Exception:
+            if cache_store is self._memory:
+                raise
+            self._store = self._memory
+            await self._memory.set_diagnosis(cache_key, value, self.ttl_seconds)
 
     async def singleflight(self, tool: str, signature: str, factory: Any) -> Any:
         """Run one async diagnosis for concurrent failures with the same signature."""

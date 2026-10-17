@@ -4,6 +4,7 @@ from collections.abc import Mapping, Set
 from typing import Any
 
 from app.schemas import GateVerdict, GuardrailCheck, MappingOp
+from app.field_matching import matching_sources
 
 
 _SENSITIVE_PARTS = ("auth", "token", "scope", "credential", "secret", "password")
@@ -15,6 +16,7 @@ def evaluate_mapping(
     *,
     implicated_paths: Set[str],
     header_allowlist: Mapping[str, str] | None = None,
+    schema: Mapping[str, Any] | None = None,
 ) -> GateVerdict:
     """Evaluate every named safety check and return the complete guardrail matrix."""
     allowed_headers = header_allowlist or {}
@@ -93,10 +95,10 @@ def evaluate_mapping(
         if not source_found:
             continue
         source_kind = _value_kind(source_value)
-        candidates = [
-            path for path, value in _value_paths(payload)
-            if path not in implicated_paths and _value_kind(value) == source_kind
-        ]
+        candidates = matching_sources(
+            payload, op.target, implicated_paths,
+            lambda value: _value_kind(value) == source_kind,
+        )
         if len(candidates) > 1:
             ambiguity_issues.append(
                 f"operation {index}: {op.target} has {len(candidates)} compatible source candidates"

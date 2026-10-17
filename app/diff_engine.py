@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.sanitizer import sanitize_error, sanitize_error_details
 from app.schemas import Diagnosis, MappingOp
+from app.field_matching import matching_sources
 
 
 _FIELD_LABEL_RE = re.compile(
@@ -33,6 +34,7 @@ def diagnose_error(
     payload: Mapping[str, Any],
     *,
     header_allowlist: Mapping[str, str] | None = None,
+    schema: Mapping[str, Any] | None = None,
 ) -> Diagnosis | None:
     """Parse common validation errors and infer only unique, type-compatible mappings."""
     sanitized = sanitize_error_details(error_body)
@@ -48,6 +50,8 @@ def diagnose_error(
             ops.append(MappingOp(op="add_header", header=header))
             continue
         missing, target_type = _decode_constraint(constraint)
+        if missing and target_type is None:
+            target_type = _schema_type_at_pointer(schema, path)
         found, current = _read_path(payload, path)
         if not missing and found and target_type is not None:
             if not _cast_is_lossless(current, target_type):
@@ -61,12 +65,16 @@ def diagnose_error(
         if not missing:
             continue
         if target_type is None:
-            # A required field with no type evidence has no safe compatibility test.
-            return None
-        candidates = [
-            (source, value) for source, value in _payload_values(payload)
-            if source and source not in implicated and _cast_is_lossless(value, target_type)
-        ]
+            # Without a declared target type, only a unique near-identical field name
+            # can establish a conservative same-type rename.
+            candidates = matching_sources(
+                payload, path, implicated, lambda value: value is not None and isinstance(value, (str, int, float, bool)),
+            )
+            candidates = [pair for pair in candidates if _field_name_distance(pair[0], path) <= 1]
+        else:
+            candidates = matching_sources(
+                payload, path, implicated, lambda value: _cast_is_lossless(value, target_type),
+            )
         if len(candidates) != 1:
             return None
         source, value = candidates[0]
@@ -164,6 +172,30 @@ def _decode_constraint(value: str) -> tuple[bool, str | None]:
     if value == "missing":
         return True, None
     return False, value if value in {"integer", "number", "boolean", "string"} else None
+
+
+def _schema_type_at_pointer(schema: Mapping[str, Any] | None, pointer: str) -> str | None:
+    current: Any = schema
+    for part in (segment.replace("~1", "/").replace("~0", "~") for segment in pointer.strip("/").split("/") if segment):
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get("properties", {}).get(part)
+    kind = current.get("type") if isinstance(current, Mapping) else None
+    return {"integer": "integer", "number": "number", "boolean": "boolean", "string": "string"}.get(kind)
+
+
+def _field_name_distance(source: str, target: str) -> int:
+    left = re.sub(r"[^a-z0-9]", "", source.rsplit("/", 1)[-1].lower())
+    right = re.sub(r"[^a-z0-9]", "", target.rsplit("/", 1)[-1].lower())
+    if abs(len(left) - len(right)) > 1:
+        return 99
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, 1):
+        row = [i]
+        for j, b in enumerate(right, 1):
+            row.append(min(row[-1] + 1, previous[j] + 1, previous[j - 1] + (a != b)))
+        previous = row
+    return previous[-1]
 
 
 def _payload_values(payload: Mapping[str, Any]) -> list[tuple[str, Any]]:

@@ -14,3 +14,7 @@ venv/
 # Local tooling state
 .idea/
 .vscode/
+
+problemStatement.txt
+.healgate/
+custom_apis.md

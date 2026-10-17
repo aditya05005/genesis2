@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from typing import Any
 
 import httpx
 
 from app.audit import AuditLog
+from app.config import load_local_env
 from app.diff_engine import GeminiMappingDiagnoser
 from app.executor import HealingExecutor
 from app.metrics import summarize_cases
@@ -27,6 +29,8 @@ async def run_evaluation(
     """Exercise supported, unsafe, and response-drift cases and score outcomes."""
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
+    load_local_env()
+    tier2_enabled = llm_diagnoser is not None or bool(os.environ.get("GEMINI_API_KEY"))
     transport = httpx.ASGITransport(app=mock_app)
     audit_log = AuditLog()
     cases: list[dict[str, Any]] = []
@@ -60,7 +64,7 @@ async def run_evaluation(
             {"user_id": "123"}, {},
         ),
     ]
-    if llm_diagnoser is not None or baseline_agent is not None:
+    if tier2_enabled or baseline_agent is not None:
         base_scenarios.append((
             "profile_nesting", "healable", {"user_id": "123"},
             {"profile": {"id": "123"}}, {},
@@ -87,11 +91,11 @@ async def run_evaluation(
             configured.raise_for_status()
             await admin.delete("/admin/records")
 
-            if mutation == "profile_nesting" and llm_diagnoser is None:
+            if mutation == "profile_nesting" and not tier2_enabled:
                 cases.append({
                     "mutation": mutation, "run": run_number, "expected": expected,
                     "error_format": error_format,
-                    "classification": "skipped", "reason": "requires --gemini",
+                    "classification": "skipped", "reason": "set GEMINI_API_KEY to run Tier 2",
                 })
             else:
                 registry = SchemaRegistry()
@@ -182,13 +186,13 @@ async def run_evaluation(
                     error=baseline_result.error,
                 ))
 
-    if baseline_agent is None and llm_diagnoser is None:
+    if baseline_agent is None and not tier2_enabled:
         for run_number in range(1, repeats + 1):
             for error_format in error_formats:
                 cases.append({
                     "mutation": "profile_nesting", "run": run_number,
                     "expected": "healable", "error_format": error_format,
-                    "classification": "skipped", "reason": "requires --gemini",
+                    "classification": "skipped", "reason": "set GEMINI_API_KEY to run Tier 2",
                 })
     tier1_coverage_by_format = {
         error_format: summarize_cases([
@@ -276,9 +280,8 @@ def _score_case(
 
 
 def main() -> None:
-    """Print HealGate scores and an optional LangChain baseline comparison."""
+    """Print HealGate scores with Gemini Tier 2 and an optional baseline comparison."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gemini", action="store_true", help="include the Gemini-only mutation")
     parser.add_argument(
         "--baseline", action="store_true",
         help="run the direct LangChain/Gemini agent for comparison",
@@ -288,7 +291,7 @@ def main() -> None:
         help="repeat each mutation for more meaningful aggregate statistics",
     )
     args = parser.parse_args()
-    diagnoser = GeminiMappingDiagnoser.from_env() if args.gemini else None
+    diagnoser = GeminiMappingDiagnoser.from_env()
     baseline = LangChainBaseline.from_env() if args.baseline else None
     print(json.dumps(asyncio.run(run_evaluation(
         llm_diagnoser=diagnoser, baseline_agent=baseline, repeats=args.runs
